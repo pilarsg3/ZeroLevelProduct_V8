@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build / dist
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Output files
+output/
