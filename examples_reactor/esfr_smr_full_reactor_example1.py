@@ -22,9 +22,11 @@ Manual override
 """
 
 import math
-from assemble           import assemble_objects
-#from component_resolver import resolve
-from ocp_vscode         import show
+import datetime
+from assemble import assemble_objects
+from component_resolver import resolve
+from ocp_vscode import show
+from utils import convert_polar_to_cartesian
 
 
 # ── Vertical stack ─────────────────────────────────────────────────────
@@ -34,17 +36,20 @@ _DIAGRID_TOP_Z     = _DIAGRID_Z_BOTTOM + 1.050
 _CORE_Z_BOTTOM     = _DIAGRID_TOP_Z
 _CORE_HEIGHT       = 3.910
 
-_RPV_STRAIGHT_H = 9.0
+_RV_STRAIGHT_H = 9.0
+
+_PUMP_BARREL_H = 12.0
+_PUMP_CENTER_Z = _RV_STRAIGHT_H + 0.5 - _PUMP_BARREL_H / 2  # barrel top flush with plate top
 
 
 # ── Components: geometry only ──────────────────────────────────────────
 
-RPV = {
+RV = {
     "obj_type":           "reactor_vessel",
-    "obj_id":             "rpv",
+    "obj_id":             "rv",
     "inner_d":            8.91,
     "wall_t":             0.05,
-    "straight_h":         _RPV_STRAIGHT_H,
+    "straight_h":         _RV_STRAIGHT_H,
     "bottom_head_type":   "torispherical",
     "bottom_head_params": {"Rc": 5.245, "rk": 0.379},
 }
@@ -54,7 +59,7 @@ TOP_PLATE = {
     "obj_id":    "top_plate",
     "outer_d":   10.0,
     "thickness": 0.5,
-    "z_bottom":  _RPV_STRAIGHT_H,
+    "z_bottom":  _RV_STRAIGHT_H,
     "hole_groups": [
         {"hole_diameter": 2.224, "layout": "explicit_positions",
          "positions": [(0.0, 0.0)]},
@@ -65,16 +70,15 @@ TOP_PLATE = {
     ],
 }
 
-# IHX still uses manual placement (no resolver rule yet for ihx ↔ top_plate).
+# IHX placement is resolver-driven: _resolve_ihx_topplate sets center_coords
+# so the bundle window top lands one upper_plenum_wall below the top plate bottom.
 _IHX_R = 2.730
-def _make_ihx(obj_id, angle_deg, center_z=7.0):
-    rad = math.radians(angle_deg)
+def _make_ihx(obj_id, angle_deg):
     return {
-        "obj_type":          "ihx",
-        "obj_id":            obj_id,
-        "manual_placement":  True,
-        "center_coords":     (_IHX_R * math.cos(rad), _IHX_R * math.sin(rad), center_z),
-        "rotation_angles":   (0.0, 0.0, angle_deg),
+        "obj_type":     "ihx",
+        "obj_id":       obj_id,
+        "at_radius":    _IHX_R,
+        "at_angle_deg": angle_deg,
         "lower_plenum_inner_radius": 0.760, "lower_plenum_wall": 0.025,
         "lower_plenum_height":       0.600, "lower_plenum_dome_radius": 0.785,
         "upper_plenum_inner_radius": 0.760, "upper_plenum_wall": 0.025,
@@ -96,33 +100,39 @@ def _make_ihx(obj_id, angle_deg, center_z=7.0):
         "lateral_pipe_length":       0.50, "lateral_pipe_z_offset": 0.30,
         "bundle_shell_inner_radius": 0.775, "bundle_shell_wall": 0.025,
         "bundle_shell_n_bars":       8,    "bundle_shell_bar_width": 0.030,
-        "bundle_shell_window_height":2.50,
+        "bundle_shell_window_fraction": 0.1,  # 10 % of bundle_height (6.0 m)
+        "bundle_shell_window_z_from_top": 1, #0.33,  # gap from z_up_bot to window top (default 0.3 + 10%)
+        "z_bottom": 2,  # 5% higher than 1.6
     }
 IHX1 = _make_ihx("ihx_1",   0.0)
 IHX2 = _make_ihx("ihx_2", 120.0)
 IHX3 = _make_ihx("ihx_3", 240.0)
 
 
-# ── Pumps: GEOMETRY + intent. No center_coords, no rotation_angles. ────
+# ── Pumps: placed at the empty top-plate holes (group 2, r=3.369, 60/180/300°). ────
 def _make_pump(obj_id, angle_deg):
+    x, y, _ = convert_polar_to_cartesian(3.369, math.radians(angle_deg), 0.0)
     return {
-        "obj_type":        "primary_pump",
-        "obj_id":          obj_id,
-        "at_angle_deg":    angle_deg,
-        "at_radius":       3.369,
-        "barrel_radius":   1.350 / 2,
-        "barrel_wall_t":   0.040,
-        "barrel_height":   12.0,
-        "nozzle_r_pipe":   0.460 / 2,
-        "nozzle_wall_t":   0.025,
-        "nozzle_L_leg":    0.600,
-        "nozzle_R_bend":   0.460,
-        "nozzle_arc_deg":  105.0,
-        "nozzle_L_inlet":  0.050,
-        "nozzle_z":        0.450,
-        "flange_width":    0.548,
-        "flange_height":   0.900,
-        "flange_depth":    0.500,
+        "obj_type":          "primary_pump",
+        "obj_id":            obj_id,
+        #"manual_placement":  True,
+        #"center_coords":     (x, y, _PUMP_CENTER_Z),
+        #"rotation_angles":   (0.0, 0.0, angle_deg),
+        "barrel_radius":     1.350 / 2,
+        "barrel_wall_t":     0.040,
+        "barrel_height":     _PUMP_BARREL_H,
+        "nozzle_r_pipe":     0.460 / 2,
+        "nozzle_wall_t":     0.025,
+        "nozzle_L_leg":      0.600,
+        "nozzle_R_bend":     0.460,
+        "nozzle_arc_deg":    105.0,
+        "nozzle_L_inlet":    0.050,
+        "nozzle_z":          0.450,
+        "flange_width":      0.548,
+        "flange_height":     0.900,
+        "flange_depth":      0.500,
+        "at_radius":         3.369,
+        "at_angle_deg":      angle_deg,
     }
 PUMP1 = _make_pump("pump_1",  60.0)
 PUMP2 = _make_pump("pump_2", 180.0)
@@ -186,8 +196,8 @@ _ACS_COLLAR_HEIGHT       = 0.500   # = top plate thickness (lock fit)
 
 # Local z2 = collar bottom in ACS-local coordinates
 _ACS_Z2_LOCAL = _ACS_BOTTOM_RING_HEIGHT + _ACS_CONE_HEIGHT
-# Place ACS so its collar bottom lands on the top plate bottom (= _RPV_STRAIGHT_H)
-_ACS_Z_BOTTOM = _RPV_STRAIGHT_H - _ACS_Z2_LOCAL
+# Place ACS so its collar bottom lands on the top plate bottom (= _RV_STRAIGHT_H)
+_ACS_Z_BOTTOM = _RV_STRAIGHT_H - _ACS_Z2_LOCAL
 
 ABOVE_CORE_STRUCTURE = {
     "obj_type":             "above_core_structure",
@@ -217,7 +227,7 @@ ABOVE_CORE_STRUCTURE = {
 
 # ── Resolve + assemble ─────────────────────────────────────────────────
 user_dicts = [
-    RPV, TOP_PLATE,
+    RV, TOP_PLATE,
     IHX1, IHX2, IHX3,
     PUMP1, PUMP2, PUMP3,
     DIAGRID,
@@ -229,8 +239,9 @@ user_dicts = [
 for d in user_dicts:
     d.setdefault("operation", "primitive")
 
-#resolved = resolve(user_dicts)
-show(assemble_objects(user_dicts, export_path="output/example_0527_V7_from_user_assembly_with_validation_and_components_names_with_ihx_together_reversed_with_acs.step"))
+resolved = resolve(user_dicts)
+_TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+show(assemble_objects(resolved, export_path=f"output/esfr_smr_full_reactor_{_TS}.step"))
 
 
 
