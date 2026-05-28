@@ -102,7 +102,11 @@ def create_ihx(spec: Dict[str, Any]) -> cq.Workplane:
         bundle_shell_wall           Wall thickness.
         bundle_shell_n_bars         Number of vertical bars (= number of windows).
         bundle_shell_bar_width      Arc-length width of each bar at the inner surface.
-        bundle_shell_window_height  Height of the window openings.
+        bundle_shell_window_height  (optional) Absolute height of the window openings.
+                                    Takes priority over bundle_shell_window_fraction.
+        bundle_shell_window_fraction (optional) Window height as a fraction of bundle_height.
+                                    Used when bundle_shell_window_height is absent.
+                                    Default 0.4 if neither key is provided.
         bundle_shell_window_z_from_top (optional) Gap from the shell top to the window
                                     top edge. Default 0 (windows flush with top).
 
@@ -271,8 +275,13 @@ def create_ihx(spec: Dict[str, Any]) -> cq.Workplane:
         bs_or     = bs_ir + bs_wall
         bs_n_bars = int(spec["bundle_shell_n_bars"])
         bs_bar_w  = float(spec["bundle_shell_bar_width"])    # arc length at inner surface
-        bs_win_h  = float(spec["bundle_shell_window_height"])
-        bs_win_dz = float(spec.get("bundle_shell_window_z_from_top", 0.0))
+        if "bundle_shell_window_height" in spec:
+            bs_win_h = float(spec["bundle_shell_window_height"])
+        else:
+            fraction = float(spec.get("bundle_shell_window_fraction", 0.4))
+            bs_win_h = bh * fraction
+        # Default gap = half the window height below the upper plenum bottom plate.
+        bs_win_dz = float(spec.get("bundle_shell_window_z_from_top", bs_win_h / 2.0))
 
         assert bs_n_bars >= 1, "bundle_shell_n_bars must be >= 1"
         bar_half_angle = bs_bar_w / (2.0 * bs_ir)          # radians
@@ -285,22 +294,40 @@ def create_ihx(spec: Dict[str, Any]) -> cq.Workplane:
         # Shell extends by _overshoot into both plates for fusion connectivity
         bs_sh = _annular_cyl(bs_ir, bs_wall, bh + 2 * _overshoot, z_bot=z_lp_top - _overshoot)
 
-        # Window zone at upper part of shell
-        z_win_top = z_up_bot - bs_win_dz
-        z_win_bot = z_win_top - bs_win_h
-        z_win_cen = (z_win_bot + z_win_top) / 2.0
+        # Shared cutter dimensions (same for both window rows)
+        cutter_h = bs_win_h * 1.05
+        chord    = 2.0 * (bs_or + bs_wall * 0.2) * math.sin(win_half_angle)
+        depth    = bs_wall * 3.0
+        x_cen    = bs_ir + bs_wall / 2.0   # radial centre of wall
 
-        # Box cutter: depth through wall, width = chord at outer surface, height = window
-        chord = 2.0 * (bs_or + 2.0) * math.sin(win_half_angle)
-        depth = bs_wall + 4.0
-        x_cen = bs_ir + bs_wall / 2.0   # radial centre of wall
+        # Upper windows: top-anchored at z_up_bot − bs_win_dz.
+        # 5 % overshoot goes downward only → never intrudes into upper plenum plate.
+        z_win_top      = z_up_bot - bs_win_dz
+        cutter_cen_top = z_win_top - cutter_h / 2.0
 
         for i in range(bs_n_bars):
             theta_deg = 360.0 * i / bs_n_bars
             cutter = (
                 cq.Workplane("XY")
-                .box(depth, chord, bs_win_h + 2.0)
-                .translate((x_cen, 0.0, z_win_cen))
+                .box(depth, chord, cutter_h)
+                .translate((x_cen, 0.0, cutter_cen_top))
+                .rotate((0, 0, 0), (0, 0, 1), theta_deg)
+                .val()
+            )
+            bs_sh = bs_sh.cut(cutter)       # type: ignore
+
+        # Lower windows: symmetric to upper — same gap (bs_win_dz) from the lower
+        # plenum top plate. Bottom-anchored at z_lp_top + bs_win_dz.
+        # 5 % overshoot goes upward only → never intrudes into lower plenum plate.
+        z_bot_win_bot  = z_lp_top + bs_win_dz
+        cutter_cen_bot = z_bot_win_bot + cutter_h / 2.0
+
+        for i in range(bs_n_bars):
+            theta_deg = 360.0 * i / bs_n_bars
+            cutter = (
+                cq.Workplane("XY")
+                .box(depth, chord, cutter_h)
+                .translate((x_cen, 0.0, cutter_cen_bot))
                 .rotate((0, 0, 0), (0, 0, 1), theta_deg)
                 .val()
             )
@@ -531,11 +558,11 @@ if __name__ == "__main__":
         "lateral_pipe_length":        300.0,
         "lateral_pipe_z_offset":      150.0,
         # Bundle shell — wrapper cylinder with windowed upper section
-        "bundle_shell_inner_radius": 285.0,   # > outermost tube edge (260+10=270)
-        "bundle_shell_wall":          15.0,
-        "bundle_shell_n_bars":         8,
-        "bundle_shell_bar_width":      20.0,
-        "bundle_shell_window_height": 600.0,
+        "bundle_shell_inner_radius":    285.0,   # > outermost tube edge (260+10=270)
+        "bundle_shell_wall":            15.0,
+        "bundle_shell_n_bars":           8,
+        "bundle_shell_bar_width":        20.0,
+        "bundle_shell_window_fraction":   0.2,  # 20 % of bundle_height (400 mm)
     }
 
     print("Building simple IHX ...")

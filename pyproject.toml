@@ -31,6 +31,8 @@ dependencies = [
 py-modules = [
     "assemble",
     "build_3D_solid",
+    "component_anchors",
+    "component_resolver",
     "components_3D_primitives",
     "profile_built_in_2D_sketch",
     "profile_from_straight_connections",
