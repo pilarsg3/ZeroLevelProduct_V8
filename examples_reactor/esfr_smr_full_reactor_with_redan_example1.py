@@ -1,197 +1,568 @@
 """
-esfr_smr_full_reactor_with_redan_example1.py
-─────────────────────────────────────────────
-Full-reactor (skeleton) assembly demonstrating the new `redan` component,
-built the ZLP way: every component is a SPEC DICT, assembled through
-assemble_objects().
+Example user assembly — paramak-style.
 
-The redan's three anchor points are derived from the surrounding components,
-exactly as described in the sketch:
+The user writes ONLY geometric parameters. There are no `center_coords`,
+no `rotation_angles`, no cross-component fields like `nozzle_z_abs` on
+the diagrid. The resolver fills those in by inspecting which components
+are in the assembly and applying its connection rules.
 
-    A = intersection of the reactor top plate and the inner wall of the RPV
-          → radius = RPV inner radius,  z = RPV straight height (top plate bottom)
-    B = where the top of the core starts
-          → radius = redan lower-cylinder radius,  z = core top
-    C = the bottom of the core, but the shell extends down to rest on the
-        strongback
-          → radius = redan lower-cylinder radius,  z = strongback top
+How the user influences placement:
+  • Each component declares its OWN positioning intent in human terms
+    (e.g. a pump declares `at_angle_deg` and `at_radius`).
+  • Diagrid/strongback/etc. just declare `z_bottom` (vertical stack).
+  • The resolver does the rest.
 
-All lengths are in metres.  The redan wall thickness is 0.025 m (= 25 mm).
-
-Registration
-------------
-The dict interface dispatches via PREMADE_BUILDERS, calling the registered
-entry as builder(spec_dict).  Since create_redan() takes keyword arguments
-(like every other create_* function), register a dict-unpacking wrapper.
-Add this once to components_premade/__init__.py, alongside the existing
-component registrations:
-
-    from .components_premade_redan import create_redan
-
-    _REDAN_META = {"obj_type", "obj_id", "operation", "name", "color",
-                   "center_coords", "center_coords_pol", "rotation_angles",
-                   "insert_into", "material", "material_tag", "manual_placement"}
-
-    def _build_redan(obj):
-        return create_redan(**{k: v for k, v in obj.items()
-                               if k not in _REDAN_META})
-
-    PREMADE_BUILDERS["redan"] = _build_redan
-
-The defensive register below lets this script run even before you edit it.
+Manual override
+  • To bypass the resolver for one component, set both `center_coords`
+    and `rotation_angles` explicitly — the resolver will respect them
+    and only fill in cross-component params on the OTHER side of the
+    connection (e.g. boss angles on the diagrid).
+  • To remove a component from resolver consideration entirely, set
+    `manual_placement: True`.
 """
 
-from __future__ import annotations
-
 import math
-
+import datetime
 from assemble import assemble_objects
-
-# ── Make `redan` available to the dict-driven builder ─────────────────────
-# build_premade_component() calls PREMADE_BUILDERS[obj_type](obj), passing the
-# WHOLE spec dict as one positional argument — so the registered entry must be
-# a dict-unpacking wrapper, not the kwargs-based create_redan() directly.
-from components_premade import PREMADE_BUILDERS
-from components_premade.components_premade_redan import create_redan
-
-_REDAN_META = {"obj_type", "obj_id", "operation", "name", "color",
-               "center_coords", "center_coords_pol", "rotation_angles",
-               "insert_into", "material", "material_tag", "manual_placement"}
+from component_resolver import resolve
+from ocp_vscode import show
+from utils import convert_polar_to_cartesian
 
 
-def _build_redan(obj):
-    return create_redan(**{k: v for k, v in obj.items() if k not in _REDAN_META})
+# ── Vertical stack ─────────────────────────────────────────────────────
+_SB_Z_BOTTOM       = -1.702
+_DIAGRID_Z_BOTTOM  = _SB_Z_BOTTOM + 1.242
+_DIAGRID_TOP_Z     = _DIAGRID_Z_BOTTOM + 1.050
+_CORE_Z_BOTTOM     = _DIAGRID_TOP_Z
+_CORE_HEIGHT       = 3.910
+
+_RV_STRAIGHT_H = 9.0
+
+_PUMP_BARREL_H = 12.0
+_PUMP_CENTER_Z = _RV_STRAIGHT_H + 0.5 - _PUMP_BARREL_H / 2  # barrel top flush with plate top
 
 
-PREMADE_BUILDERS.setdefault("redan", _build_redan)
+# ── Components: geometry only ──────────────────────────────────────────
 
+RV = {
+    "obj_type":           "reactor_vessel",
+    "obj_id":             "rv",
+    "inner_d":            8.91,
+    "wall_t":             0.05,
+    "straight_h":         _RV_STRAIGHT_H,
+    "bottom_head_type":   "torispherical",
+    "bottom_head_params": {"Rc": 5.245, "rk": 0.379},
+}
 
-# ════════════════════════════════════════════════════════════════════════
-#  1.  Shared reactor geometry (metres)
-# ════════════════════════════════════════════════════════════════════════
+TOP_PLATE = {
+    "obj_type":  "reactor_top_plate",
+    "obj_id":    "top_plate",
+    "outer_d":   10.0,
+    "thickness": 0.5,
+    "z_bottom":  _RV_STRAIGHT_H,
+    "hole_groups": [
+        {"hole_diameter": 2.224, "layout": "explicit_positions",
+         "positions": [(0.0, 0.0)]},
+        {"hole_diameter": 1.600, "layout": "symmetric", "count": 3,
+         "placement_radius": 3.100, "start_angle_deg": 0.0},
+        {"hole_diameter": 1.350, "layout": "symmetric", "count": 3,
+         "placement_radius": 3.369, "start_angle_deg": 60.0},
+    ],
+}
 
-# ── Reactor vessel ────────────────────────────────────────────────────────
-RPV_INNER_D    = 4.72
-RPV_INNER_R    = RPV_INNER_D / 2.0          # 2.36
-RPV_WALL_T     = 0.04
-RPV_STRAIGHT_H = 5.50                       # shell runs z = 0 → 5.50
-TOP_PLATE_T    = 0.10                        # plate bottom flush at z = 5.50
-
-# ── Strongback (support; rests near the vessel bottom) ────────────────────
-SB_Z_BOTTOM = -1.00
-SB_HEIGHT   = 0.90
-SB_TOP      = SB_Z_BOTTOM + SB_HEIGHT       # -0.10   (← redan point C sits here)
-
-# ── Diagrid (sits on the strongback) ──────────────────────────────────────
-DIAGRID_DIAM  = 2.80                        # r = 1.40
-DIAGRID_THICK = 0.70
-DIAGRID_Z_BOT = SB_TOP                      # -0.10
-DIAGRID_TOP   = DIAGRID_Z_BOT + DIAGRID_THICK   # 0.60
-
-# ── Core (hexagonal prism, sits on the diagrid) ───────────────────────────
-CORE_R     = 1.20                           # circumscribed radius
-CORE_H     = 1.00
-CORE_Z_BOT = DIAGRID_TOP                    # 0.60
-CORE_Z_TOP = CORE_Z_BOT + CORE_H            # 1.60   (← redan point B sits here)
-
-# ── Redan ─────────────────────────────────────────────────────────────────
-REDAN_LOWER_R    = 1.50                     # clears core (1.20) and diagrid (1.40)
-REDAN_THICKNESS  = 0.025                    # 25 mm
-REDAN_SHOULDER_Z = 3.00                     # top cylindrical section ends here
-
-# ── Derived redan anchors ─────────────────────────────────────────────────
-A = (RPV_INNER_R,   RPV_STRAIGHT_H)         # (2.36,  5.50)
-B = (REDAN_LOWER_R, CORE_Z_TOP)             # (1.50,  1.60)
-C = (REDAN_LOWER_R, SB_TOP)                 # (1.50, -0.10)
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  2.  Component spec dicts  (this is the "dictionary input")
-# ════════════════════════════════════════════════════════════════════════
-
-specs = [
-    {
-        "operation": "primitive",
-        "obj_type":  "reactor_vessel",
-        "obj_id":    "rpv",
-        "inner_d":    RPV_INNER_D,
-        "wall_t":     RPV_WALL_T,
-        "straight_h": RPV_STRAIGHT_H,
-        "bottom_head_type":   "ellipsoidal",
-        "bottom_head_params": {"head_depth": 1.0},
-        "top_plate_thickness": TOP_PLATE_T,
-        "top_plate_hole_groups": [
-            {"hole_diameter": 0.52, "layout": "custom_angles",
-             "angles_deg": [0.0, 90.0, 180.0, 270.0], "placement_radius": 1.85},
+# IHX placement is resolver-driven: _resolve_ihx_topplate sets center_coords
+# so the bundle window top lands one upper_plenum_wall below the top plate bottom.
+_IHX_R = 3.100
+def _make_ihx(obj_id, angle_deg):
+    return {
+        "obj_type":     "ihx",
+        "obj_id":       obj_id,
+        "at_radius":    _IHX_R,
+        "at_angle_deg": angle_deg,
+        "lower_plenum_inner_radius": 0.760, "lower_plenum_wall": 0.025,
+        "lower_plenum_height":       0.600, "lower_plenum_dome_radius": 0.785,
+        "upper_plenum_inner_radius": 0.760, "upper_plenum_wall": 0.025,
+        "upper_plenum_height":       0.600, "upper_plenum_dome_radius": 0.785,
+        "bundle_height":             6.0,
+        "tube_rings": [
+            dict(n=8,  inner_radius=0.020, wall=0.003, pitch_radius=0.12),
+            dict(n=16, inner_radius=0.018, wall=0.003, pitch_radius=0.25),
+            dict(n=24, inner_radius=0.016, wall=0.003, pitch_radius=0.40),
+            dict(n=32, inner_radius=0.014, wall=0.003, pitch_radius=0.55),
+            dict(n=40, inner_radius=0.014, wall=0.003, pitch_radius=0.70),
         ],
+        "central_pipe_inner_radius": 0.20, "central_pipe_wall": 0.025,
+        "central_pipe_bend_radius":  0.25, "central_pipe_z_offset": 0.20,
+        "central_pipe_horiz_len":    0.60,
+        "riser_inner_radius":        0.20, "riser_wall": 0.025,
+        "riser_height":              0.60,
+        "lateral_pipe_inner_radius": 0.10, "lateral_pipe_wall": 0.015,
+        "lateral_pipe_length":       0.50, "lateral_pipe_z_offset": 0.30,
+        "bundle_shell_inner_radius": 0.775, "bundle_shell_wall": 0.025,
+        "bundle_shell_n_bars":       8,    "bundle_shell_bar_width": 0.030,
+        "bundle_shell_window_fraction": 0.1,  # 10 % of bundle_height (6.0 m)
+        "bundle_shell_window_z_from_top": 1, #0.33,  # gap from z_up_bot to window top (default 0.3 + 10%)
+        "bundle_shell_window_z_from_bottom": 0.3,    # ↓ lower row only, leaves upper unchanged
+        "z_bottom": 2,  # 5% higher than 1.6
+    }
+IHX1 = _make_ihx("ihx_1",   0.0)
+IHX2 = _make_ihx("ihx_2", 120.0)
+IHX3 = _make_ihx("ihx_3", 240.0)
+
+
+# ── Pumps: placed at the empty top-plate holes (group 2, r=3.369, 60/180/300°). ────
+def _make_pump(obj_id, angle_deg):
+    x, y, _ = convert_polar_to_cartesian(3.369, math.radians(angle_deg), 0.0)
+    return {
+        "obj_type":          "primary_pump",
+        "obj_id":            obj_id,
+        #"manual_placement":  True,
+        #"center_coords":     (x, y, _PUMP_CENTER_Z),
+        #"rotation_angles":   (0.0, 0.0, angle_deg),
+        "barrel_radius":     1.350 / 2,
+        "barrel_wall_t":     0.040,
+        "barrel_height":     _PUMP_BARREL_H,
+        "nozzle_r_pipe":     0.460 / 2,
+        "nozzle_wall_t":     0.025,
+        "nozzle_L_leg":      0.600,
+        "nozzle_R_bend":     0.460,
+        "nozzle_arc_deg":    105.0,
+        "nozzle_L_inlet":    0.050,
+        "nozzle_z":          0.450,
+        "flange_width":      0.548,
+        "flange_height":     0.900,
+        "flange_depth":      0.500,
+        "at_radius":         3.369,
+        "at_angle_deg":      angle_deg,
+    }
+PUMP1 = _make_pump("pump_1",  60.0)
+PUMP2 = _make_pump("pump_2", 180.0)
+PUMP3 = _make_pump("pump_3", 300.0)
+
+
+# ── Diagrid: GEOMETRY only. Resolver fills in boss params + Z. ─────────
+DIAGRID = {
+    "obj_type":      "diagrid",
+    "obj_id":        "diagrid",
+    "diameter":      4.660,
+    "thickness":     1.050,
+    "z_bottom":      _DIAGRID_Z_BOTTOM,
+    "wall_t_side":   0.030,
+    "wall_t_top":    0.030,
+    "wall_t_bottom": 0.030,
+}
+
+CORE = {
+    "obj_type": "reactor_core",
+    "obj_id":   "core",
+    "radius":   3.600 / 2,
+    "height":   _CORE_HEIGHT,
+    "z_bottom": _CORE_Z_BOTTOM,
+}
+
+STRONGBACK = {
+    "obj_type":               "strongback",
+    "obj_id":                 "strongback",
+    "total_height":           1.242,
+    "flange_radius":          2.684,
+    "skirt_outer_radius":     3.030,
+    "skirt_inner_radius":     2.243,
+    "skirt_height":           0.436,
+    "taper_bottom_z":         0.356,
+    "bore_radius":            0.303,
+    "small_hole_radius":      0.0755,
+    "small_hole_count":       6,
+    "small_hole_placement_r": 0.900,
+    "z_bottom":               _SB_Z_BOTTOM,
+}
+
+# ── Redan (hot/cold pool separation shell) ───────────────────────────────
+# Half-section A → B → C revolved 360° about Z. With thickness_side="in",
+# the A–B–C polyline is the OUTER surface of the shell, so:
+#   A = top plate ∩ RPV inner wall      → (RV inner radius, top of RV shell)
+#   B = top of core                     → (redan lower radius, core top)
+#   C = top of the diagrid              → (redan lower radius, diagrid top)
+# The lower cylinder rests on the top face of the diagrid, so r_lower is
+# kept below the diagrid outer radius (r=2.330) and above the core radius
+# (r=1.800). The optional z_shoulder gives a cylindrical top section before
+# the taper.
+#
+# Note: this simple revolved shell has no penetrations for the IHX bundles
+# or the pump nozzles, so overlap warnings from assemble_objects are
+# expected where the redan crosses those components — those cutouts are a
+# follow-up enhancement.
+_REDAN_R_TOP      = 8.91 / 2                              # RV inner radius (= RV.inner_d / 2)
+_REDAN_R_LOWER    = 2.200                                 # clears core (r=1.800), fits on diagrid (r=2.330)
+_REDAN_Z_KNEE     = _CORE_Z_BOTTOM + _CORE_HEIGHT         # core top
+_REDAN_Z_BOTTOM   = _DIAGRID_TOP_Z                        # rests on top of the diagrid
+_REDAN_Z_SHOULDER = 6.500                                 # top cylindrical section ends here
+
+REDAN = {
+    "obj_type":       "redan",
+    "obj_id":         "redan",
+    "r_top":          _REDAN_R_TOP,
+    "z_top":          _RV_STRAIGHT_H,
+    "r_lower":        _REDAN_R_LOWER,
+    "z_knee":         _REDAN_Z_KNEE,
+    "z_bottom":       _REDAN_Z_BOTTOM,
+    "thickness":      0.025,
+    "z_shoulder":     _REDAN_Z_SHOULDER,
+    "thickness_side": "in",
+}
+
+# ── Above-core structure ─────────────────────────────────────────────────
+# The component's lower shell (bottom ring + cone + collar + neck) sits on
+# the component's local origin, and the top cylinder is displaced sideways
+# by top_cyl_offset_x. This way the cone — and the hex through-hole pattern
+# beneath it — can be aligned with the reactor core via the assembly's
+# center_coords (which the assembler defaults to (0, 0, …)), while the top
+# cylinder is offset so it doesn't clash with the pumps / IHX nozzles.
+#
+# The component is positioned vertically so that its collar (the wider
+# band between cone and neck) lands flush inside the top plate's central
+# opening:
+#   collar_height                       = top_plate_thickness
+#   z2 (collar bottom, local) + z_bottom = top_plate bottom (world)
+_ACS_TOP_CYL_HEIGHT      = 1.008
+_ACS_NECK_HEIGHT         = 0.569
+_ACS_CONE_HEIGHT         = 2.429
+_ACS_BOTTOM_RING_HEIGHT  = 0.498
+_ACS_COLLAR_HEIGHT       = 0.500   # = top plate thickness (lock fit)
+
+# Local z2 = collar bottom in ACS-local coordinates
+_ACS_Z2_LOCAL = _ACS_BOTTOM_RING_HEIGHT + _ACS_CONE_HEIGHT
+# Place ACS so its collar bottom lands on the top plate bottom (= _RV_STRAIGHT_H)
+_ACS_Z_BOTTOM = _RV_STRAIGHT_H - _ACS_Z2_LOCAL
+
+ABOVE_CORE_STRUCTURE = {
+    "obj_type":             "above_core_structure",
+    "obj_id":               "above_core_structure",
+    "top_cyl_outer_r":      1.200,           # shrunk to clear pumps & IHX
+    "top_cyl_height":       _ACS_TOP_CYL_HEIGHT,
+    "neck_outer_r":         1.1085,
+    "neck_height":          _ACS_NECK_HEIGHT,
+    "collar_outer_r":       1.1085,
+    "collar_height":        _ACS_COLLAR_HEIGHT,
+    "wall_t":               0.025,
+    "cone_height":          _ACS_CONE_HEIGHT,
+    "cone_bottom_outer_r":  1.403,
+    "bottom_ring_height":   _ACS_BOTTOM_RING_HEIGHT,
+    "closing_plate_height": 0.050,
+    "top_cyl_offset_x":     0.6056,          # original component geometry
+    "top_cyl_offset_y":     0.0,
+    "z_bottom":             _ACS_Z_BOTTOM,   # collar flush with top plate
+    "bottom_holes": {
+        "through_d":     0.080,   # Ø80 mm through-holes (all the way through)
+        "counter_d":     0.142,   # Ø142 mm counterbores
+        "counter_depth": 0.050,   # depth of counterbore from top of closing plate
+        "pitch":         0.300,   # center-to-center of the hex ring
     },
-    {
-        "operation": "primitive",
-        "obj_type":  "strongback",
-        "obj_id":    "strongback",
-        "total_height":       SB_HEIGHT,
-        "flange_radius":      1.60,          # >= redan outer radius so the
-                                             # redan ring can rest on it
-        "skirt_outer_radius": 1.00,
-        "skirt_inner_radius": 0.70,
-        "skirt_height":       0.40,
-        "taper_bottom_z":     0.30,
-        "bore_radius":            0.30,
-        "small_hole_radius":      0.07,
-        "small_hole_count":       6,
-        "small_hole_placement_r": 1.10,
-        "z_bottom": SB_Z_BOTTOM,
-    },
-    {
-        "operation": "primitive",
-        "obj_type":  "diagrid",
-        "obj_id":    "diagrid",
-        "diameter":  DIAGRID_DIAM,
-        "thickness": DIAGRID_THICK,
-        "z_bottom":  DIAGRID_Z_BOT,
-    },
-    {
-        "operation": "primitive",
-        "obj_type":  "reactor_core",
-        "obj_id":    "core",
-        "radius":   CORE_R,
-        "height":   CORE_H,
-        "z_bottom": CORE_Z_BOT,
-        "n_sides":  6,
-    },
-    {
-        "operation": "primitive",
-        "obj_type":  "redan",
-        "obj_id":    "redan",
-        "r_top":    A[0],          # A
-        "z_top":    A[1],          # A
-        "r_lower":  REDAN_LOWER_R, # B, C
-        "z_knee":   B[1],          # B
-        "z_bottom": C[1],          # C
-        "thickness":      REDAN_THICKNESS,
-        "z_shoulder":     REDAN_SHOULDER_Z,
-        "thickness_side": "in",    # A–B–C is the OUTER surface
-    },
+}
+
+
+# ── Resolve + assemble ─────────────────────────────────────────────────
+user_dicts = [
+    RV, TOP_PLATE,
+    IHX1, IHX2, IHX3,
+    PUMP1, PUMP2, PUMP3,
+    DIAGRID,
+    CORE, STRONGBACK,
+    REDAN,
+    ABOVE_CORE_STRUCTURE,
 ]
 
+# assemble_objects expects "operation": "primitive" — add it automatically.
+for d in user_dicts:
+    d.setdefault("operation", "primitive")
 
-# ════════════════════════════════════════════════════════════════════════
-#  3.  Assemble + export  (STEP gets per-part obj_id names)
-# ════════════════════════════════════════════════════════════════════════
+resolved = resolve(user_dicts)
+_TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+show(assemble_objects(resolved, export_path=f"output/esfr_smr_full_reactor_{_TS}.step"))
 
-if __name__ == "__main__":
-    print("Redan anchors:")
-    print(f"  A (top plate ∩ RPV inner wall) = {A}")
-    print(f"  B (top of core)                = {B}")
-    print(f"  C (strongback top)             = {C}")
 
-    assembly = assemble_objects(
-        specs,
-        export_path="output/esfr_smr_with_redan.step",
-    )
 
-    try:
-        from ocp_vscode import show
-        show(assembly)
-    except Exception as exc:   # viewer unavailable — STEP is still saved
-        print(f"(viewer unavailable: {exc})")
+
+
+
+
+
+
+# """
+# Example user assembly — paramak-style.
+
+# The user writes ONLY geometric parameters. There are no `center_coords`,
+# no `rotation_angles`, no cross-component fields like `nozzle_z_abs` on
+# the diagrid. The resolver fills those in by inspecting which components
+# are in the assembly and applying its connection rules.
+
+# How the user influences placement:
+#   • Each component declares its OWN positioning intent in human terms
+#     (e.g. a pump declares `at_angle_deg` and `at_radius`).
+#   • Diagrid/strongback/etc. just declare `z_bottom` (vertical stack).
+#   • The resolver does the rest.
+
+# Manual override
+#   • To bypass the resolver for one component, set both `center_coords`
+#     and `rotation_angles` explicitly — the resolver will respect them
+#     and only fill in cross-component params on the OTHER side of the
+#     connection (e.g. boss angles on the diagrid).
+#   • To remove a component from resolver consideration entirely, set
+#     `manual_placement: True`.
+# """
+
+# import math
+# import datetime
+# from assemble import assemble_objects
+# from component_resolver import resolve
+# from ocp_vscode import show
+# from utils import convert_polar_to_cartesian
+
+
+# # ── Vertical stack ─────────────────────────────────────────────────────
+# _SB_Z_BOTTOM       = -1.702
+# _DIAGRID_Z_BOTTOM  = _SB_Z_BOTTOM + 1.242
+# _DIAGRID_TOP_Z     = _DIAGRID_Z_BOTTOM + 1.050
+# _CORE_Z_BOTTOM     = _DIAGRID_TOP_Z
+# _CORE_HEIGHT       = 3.910
+
+# _RV_STRAIGHT_H = 9.0
+
+# _PUMP_BARREL_H = 12.0
+# _PUMP_CENTER_Z = _RV_STRAIGHT_H + 0.5 - _PUMP_BARREL_H / 2  # barrel top flush with plate top
+
+
+# # ── Components: geometry only ──────────────────────────────────────────
+
+# RV = {
+#     "obj_type":           "reactor_vessel",
+#     "obj_id":             "rv",
+#     "inner_d":            8.91,
+#     "wall_t":             0.05,
+#     "straight_h":         _RV_STRAIGHT_H,
+#     "bottom_head_type":   "torispherical",
+#     "bottom_head_params": {"Rc": 5.245, "rk": 0.379},
+# }
+
+# TOP_PLATE = {
+#     "obj_type":  "reactor_top_plate",
+#     "obj_id":    "top_plate",
+#     "outer_d":   10.0,
+#     "thickness": 0.5,
+#     "z_bottom":  _RV_STRAIGHT_H,
+#     "hole_groups": [
+#         {"hole_diameter": 2.224, "layout": "explicit_positions",
+#          "positions": [(0.0, 0.0)]},
+#         {"hole_diameter": 1.600, "layout": "symmetric", "count": 3,
+#          "placement_radius": 3.100, "start_angle_deg": 0.0},
+#         {"hole_diameter": 1.350, "layout": "symmetric", "count": 3,
+#          "placement_radius": 3.369, "start_angle_deg": 60.0},
+#     ],
+# }
+
+# # IHX placement is resolver-driven: _resolve_ihx_topplate sets center_coords
+# # so the bundle window top lands one upper_plenum_wall below the top plate bottom.
+# _IHX_R = 3.100
+# def _make_ihx(obj_id, angle_deg):
+#     return {
+#         "obj_type":     "ihx",
+#         "obj_id":       obj_id,
+#         "at_radius":    _IHX_R,
+#         "at_angle_deg": angle_deg,
+#         "lower_plenum_inner_radius": 0.760, "lower_plenum_wall": 0.025,
+#         "lower_plenum_height":       0.600, "lower_plenum_dome_radius": 0.785,
+#         "upper_plenum_inner_radius": 0.760, "upper_plenum_wall": 0.025,
+#         "upper_plenum_height":       0.600, "upper_plenum_dome_radius": 0.785,
+#         "bundle_height":             6.0,
+#         "tube_rings": [
+#             dict(n=8,  inner_radius=0.020, wall=0.003, pitch_radius=0.12),
+#             dict(n=16, inner_radius=0.018, wall=0.003, pitch_radius=0.25),
+#             dict(n=24, inner_radius=0.016, wall=0.003, pitch_radius=0.40),
+#             dict(n=32, inner_radius=0.014, wall=0.003, pitch_radius=0.55),
+#             dict(n=40, inner_radius=0.014, wall=0.003, pitch_radius=0.70),
+#         ],
+#         "central_pipe_inner_radius": 0.20, "central_pipe_wall": 0.025,
+#         "central_pipe_bend_radius":  0.25, "central_pipe_z_offset": 0.20,
+#         "central_pipe_horiz_len":    0.60,
+#         "riser_inner_radius":        0.20, "riser_wall": 0.025,
+#         "riser_height":              0.60,
+#         "lateral_pipe_inner_radius": 0.10, "lateral_pipe_wall": 0.015,
+#         "lateral_pipe_length":       0.50, "lateral_pipe_z_offset": 0.30,
+#         "bundle_shell_inner_radius": 0.775, "bundle_shell_wall": 0.025,
+#         "bundle_shell_n_bars":       8,    "bundle_shell_bar_width": 0.030,
+#         "bundle_shell_window_fraction": 0.1,  # 10 % of bundle_height (6.0 m)
+#         "bundle_shell_window_z_from_top": 1, #0.33,  # gap from z_up_bot to window top (default 0.3 + 10%)
+#         "z_bottom": 2,  # 5% higher than 1.6
+#     }
+# IHX1 = _make_ihx("ihx_1",   0.0)
+# IHX2 = _make_ihx("ihx_2", 120.0)
+# IHX3 = _make_ihx("ihx_3", 240.0)
+
+
+# # ── Pumps: placed at the empty top-plate holes (group 2, r=3.369, 60/180/300°). ────
+# def _make_pump(obj_id, angle_deg):
+#     x, y, _ = convert_polar_to_cartesian(3.369, math.radians(angle_deg), 0.0)
+#     return {
+#         "obj_type":          "primary_pump",
+#         "obj_id":            obj_id,
+#         #"manual_placement":  True,
+#         #"center_coords":     (x, y, _PUMP_CENTER_Z),
+#         #"rotation_angles":   (0.0, 0.0, angle_deg),
+#         "barrel_radius":     1.350 / 2,
+#         "barrel_wall_t":     0.040,
+#         "barrel_height":     _PUMP_BARREL_H,
+#         "nozzle_r_pipe":     0.460 / 2,
+#         "nozzle_wall_t":     0.025,
+#         "nozzle_L_leg":      0.600,
+#         "nozzle_R_bend":     0.460,
+#         "nozzle_arc_deg":    105.0,
+#         "nozzle_L_inlet":    0.050,
+#         "nozzle_z":          0.450,
+#         "flange_width":      0.548,
+#         "flange_height":     0.900,
+#         "flange_depth":      0.500,
+#         "at_radius":         3.369,
+#         "at_angle_deg":      angle_deg,
+#     }
+# PUMP1 = _make_pump("pump_1",  60.0)
+# PUMP2 = _make_pump("pump_2", 180.0)
+# PUMP3 = _make_pump("pump_3", 300.0)
+
+
+# # ── Diagrid: GEOMETRY only. Resolver fills in boss params + Z. ─────────
+# DIAGRID = {
+#     "obj_type":      "diagrid",
+#     "obj_id":        "diagrid",
+#     "diameter":      4.660,
+#     "thickness":     1.050,
+#     "z_bottom":      _DIAGRID_Z_BOTTOM,
+#     "wall_t_side":   0.030,
+#     "wall_t_top":    0.030,
+#     "wall_t_bottom": 0.030,
+# }
+
+# CORE = {
+#     "obj_type": "reactor_core",
+#     "obj_id":   "core",
+#     "radius":   3.600 / 2,
+#     "height":   _CORE_HEIGHT,
+#     "z_bottom": _CORE_Z_BOTTOM,
+# }
+
+# STRONGBACK = {
+#     "obj_type":               "strongback",
+#     "obj_id":                 "strongback",
+#     "total_height":           1.242,
+#     "flange_radius":          2.684,
+#     "skirt_outer_radius":     3.030,
+#     "skirt_inner_radius":     2.243,
+#     "skirt_height":           0.436,
+#     "taper_bottom_z":         0.356,
+#     "bore_radius":            0.303,
+#     "small_hole_radius":      0.0755,
+#     "small_hole_count":       6,
+#     "small_hole_placement_r": 0.900,
+#     "z_bottom":               _SB_Z_BOTTOM,
+# }
+
+# # ── Redan (hot/cold pool separation shell) ───────────────────────────────
+# # Half-section A → B → C revolved 360° about Z. With thickness_side="in",
+# # the A–B–C polyline is the OUTER surface of the shell, so:
+# #   A = top plate ∩ RPV inner wall      → (RV inner radius, top of RV shell)
+# #   B = top of core                     → (redan lower radius, core top)
+# #   C = top of the diagrid              → (redan lower radius, diagrid top)
+# # The lower cylinder rests on the top face of the diagrid, so r_lower is
+# # kept below the diagrid outer radius (r=2.330) and above the core radius
+# # (r=1.800). The optional z_shoulder gives a cylindrical top section before
+# # the taper.
+# #
+# # Note: this simple revolved shell has no penetrations for the IHX bundles
+# # or the pump nozzles, so overlap warnings from assemble_objects are
+# # expected where the redan crosses those components — those cutouts are a
+# # follow-up enhancement.
+# _REDAN_R_TOP      = 8.91 / 2                              # RV inner radius (= RV.inner_d / 2)
+# _REDAN_R_LOWER    = 2.200                                 # clears core (r=1.800), fits on diagrid (r=2.330)
+# _REDAN_Z_KNEE     = _CORE_Z_BOTTOM + _CORE_HEIGHT         # core top
+# _REDAN_Z_BOTTOM   = _DIAGRID_TOP_Z                        # rests on top of the diagrid
+# _REDAN_Z_SHOULDER = 6.500                                 # top cylindrical section ends here
+
+# REDAN = {
+#     "obj_type":       "redan",
+#     "obj_id":         "redan",
+#     "r_top":          _REDAN_R_TOP,
+#     "z_top":          _RV_STRAIGHT_H,
+#     "r_lower":        _REDAN_R_LOWER,
+#     "z_knee":         _REDAN_Z_KNEE,
+#     "z_bottom":       _REDAN_Z_BOTTOM,
+#     "thickness":      0.025,
+#     "z_shoulder":     _REDAN_Z_SHOULDER,
+#     "thickness_side": "in",
+# }
+
+# # ── Above-core structure ─────────────────────────────────────────────────
+# # The component's lower shell (bottom ring + cone + collar + neck) sits on
+# # the component's local origin, and the top cylinder is displaced sideways
+# # by top_cyl_offset_x. This way the cone — and the hex through-hole pattern
+# # beneath it — can be aligned with the reactor core via the assembly's
+# # center_coords (which the assembler defaults to (0, 0, …)), while the top
+# # cylinder is offset so it doesn't clash with the pumps / IHX nozzles.
+# #
+# # The component is positioned vertically so that its collar (the wider
+# # band between cone and neck) lands flush inside the top plate's central
+# # opening:
+# #   collar_height                       = top_plate_thickness
+# #   z2 (collar bottom, local) + z_bottom = top_plate bottom (world)
+# _ACS_TOP_CYL_HEIGHT      = 1.008
+# _ACS_NECK_HEIGHT         = 0.569
+# _ACS_CONE_HEIGHT         = 2.429
+# _ACS_BOTTOM_RING_HEIGHT  = 0.498
+# _ACS_COLLAR_HEIGHT       = 0.500   # = top plate thickness (lock fit)
+
+# # Local z2 = collar bottom in ACS-local coordinates
+# _ACS_Z2_LOCAL = _ACS_BOTTOM_RING_HEIGHT + _ACS_CONE_HEIGHT
+# # Place ACS so its collar bottom lands on the top plate bottom (= _RV_STRAIGHT_H)
+# _ACS_Z_BOTTOM = _RV_STRAIGHT_H - _ACS_Z2_LOCAL
+
+# ABOVE_CORE_STRUCTURE = {
+#     "obj_type":             "above_core_structure",
+#     "obj_id":               "above_core_structure",
+#     "top_cyl_outer_r":      1.200,           # shrunk to clear pumps & IHX
+#     "top_cyl_height":       _ACS_TOP_CYL_HEIGHT,
+#     "neck_outer_r":         1.1085,
+#     "neck_height":          _ACS_NECK_HEIGHT,
+#     "collar_outer_r":       1.1085,
+#     "collar_height":        _ACS_COLLAR_HEIGHT,
+#     "wall_t":               0.025,
+#     "cone_height":          _ACS_CONE_HEIGHT,
+#     "cone_bottom_outer_r":  1.403,
+#     "bottom_ring_height":   _ACS_BOTTOM_RING_HEIGHT,
+#     "closing_plate_height": 0.050,
+#     "top_cyl_offset_x":     0.6056,          # original component geometry
+#     "top_cyl_offset_y":     0.0,
+#     "z_bottom":             _ACS_Z_BOTTOM,   # collar flush with top plate
+#     "bottom_holes": {
+#         "through_d":     0.080,   # Ø80 mm through-holes (all the way through)
+#         "counter_d":     0.142,   # Ø142 mm counterbores
+#         "counter_depth": 0.050,   # depth of counterbore from top of closing plate
+#         "pitch":         0.300,   # center-to-center of the hex ring
+#     },
+# }
+
+
+# # ── Resolve + assemble ─────────────────────────────────────────────────
+# user_dicts = [
+#     RV, TOP_PLATE,
+#     IHX1, IHX2, IHX3,
+#     PUMP1, PUMP2, PUMP3,
+#     DIAGRID,
+#     CORE, STRONGBACK,
+#     REDAN,
+#     ABOVE_CORE_STRUCTURE,
+# ]
+
+# # assemble_objects expects "operation": "primitive" — add it automatically.
+# for d in user_dicts:
+#     d.setdefault("operation", "primitive")
+
+# resolved = resolve(user_dicts)
+# _TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+# show(assemble_objects(resolved, export_path=f"output/esfr_smr_full_reactor_{_TS}.step"))
